@@ -1,6 +1,8 @@
 import logging
 import warnings
-from typing import List, Literal, Optional, Sequence, Tuple, Union
+from typing import Iterable, List, Literal, Optional, Sequence, Tuple, Union
+
+from joblib import delayed, Parallel
 
 import numpy as np
 import pandas as pd
@@ -489,8 +491,8 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         return_numpy: Optional[bool] = None,
         velo_statistic: str = "mean",
         velo_mode: Literal[
-            "spliced_cyt", "spliced_nuc", "spliced_sum", "unspliced_nuc"
-        ] = "spliced_sum",
+            "spliced_cyt", "spliced_nuc", "unspliced_nuc"
+        ] = "spliced_cyt",
         clip: bool = True,
     ) -> Union[np.ndarray, pd.DataFrame]:
         """Returns cells by genes velocity estimates.
@@ -597,10 +599,8 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     velo_rep = nu * mean_s_nuc_rep - gamma * mean_s_cyt_rep
                 elif velo_mode == "spliced_nuc":
                     velo_rep = beta * mean_u_nuc_rep - nu * mean_s_nuc_rep
-                elif velo_mode == "unspliced_nuc":
+                else:
                     velo_rep = alpha - beta * mean_u_nuc_rep
-                elif velo_mode == "spliced_sum":
-                    velo_rep = beta * mean_u_nuc_rep - gamma * mean_s_cyt_rep
 
                 ind_time = switch_time * rho
                 (
@@ -614,10 +614,8 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     velo_ind = nu * mean_s_nuc_ind - gamma * mean_s_cyt_ind
                 elif velo_mode == "spliced_nuc":
                     velo_ind = beta * mean_u_nuc_ind - nu * mean_s_nuc_ind
-                elif velo_mode == "unspliced_nuc":
+                else:
                     velo_ind = alpha - beta * mean_u_nuc_ind
-                elif velo_mode == "spliced_sum":
-                    velo_ind = beta * mean_u_nuc_ind - gamma * mean_s_cyt_ind
 
                 velo_steady = torch.zeros_like(velo_ind)
 
@@ -1018,8 +1016,54 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
 
-    def get_directional_uncertainty(self):
-        raise NotImplementedError
+    def get_directional_uncertainty(
+        self,
+        adata: Optional[AnnData] = None,
+        n_samples: int = 100,
+        gene_list: Iterable[str] = None,
+        n_jobs: int = -1,
+        velo_mode: Literal[
+            "spliced_cyt", "spliced_nuc", "unspliced_nuc"
+        ] = "spliced_nuc",
+    ):
+        r"""Returns intrinsic uncertainty.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        gene_list
+            Return frequencies of expression for a subset of genes.
+            This can save memory when working with large datasets and few genes are
+            of interest.
+        n_samples
+            Number of posterior samples to use for estimation.
+        n_jobs
+            Number of jobs for parallel computing.
+        velo_mode
+            Which derivative to use to sample velocties.
+
+        Returns
+        -------
+        For each cell intrinsic variance statistics as `pd.DataFrame` together with `np.array`
+        """
+        adata = self._validate_anndata(adata)
+
+        logger.info("Sampling from model...")
+        velocities_all = self.get_velocity(
+            n_samples=n_samples,
+            return_mean=False,
+            gene_list=gene_list,
+            velo_mode=velo_mode,
+        )  # (n_samples, n_cells, n_genes)
+
+        df, cosine_sims = _compute_directional_statistics_tensor(
+            tensor=velocities_all, n_jobs=n_jobs, n_cells=adata.n_obs
+        )
+        df.index = adata.obs_names
+
+        return df, cosine_sims
 
     def get_permutation_scores(self):
         """Compute permutation scores."""
@@ -1028,3 +1072,87 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def _shuffle_layer_celltype(self):
         """Shuffle cells within cell types for each gene."""
         raise NotImplementedError
+
+
+def _compute_directional_statistics_tensor(
+    tensor: np.ndarray, n_jobs: int, n_cells: int
+) -> pd.DataFrame:
+    """Parallelizes function calls to compute directional uncertainty.
+
+    Parameters
+    ----------
+       tensors
+           Velocity tensor.
+       n_jobs
+           Number of jobs for parallel computing.
+       n_cells
+           Number of cells.
+
+    Returns
+    -------
+       For each cell intrinsic variance statistics as `pd.DataFrame` together with `np.array`
+    """
+    df = pd.DataFrame(index=np.arange(n_cells))
+    df["directional_variance"] = np.nan
+    df["directional_difference"] = np.nan
+    df["directional_cosine_sim_variance"] = np.nan
+    df["directional_cosine_sim_difference"] = np.nan
+    df["directional_cosine_sim_mean"] = np.nan
+    logger.info("Computing the uncertainties...")
+    results = Parallel(n_jobs=n_jobs, verbose=3)(
+        delayed(_directional_statistics_per_cell)(tensor[:, cell_index, :])
+        for cell_index in range(n_cells)
+    )
+    # cells by samples
+    cosine_sims = np.stack([results[i][0] for i in range(n_cells)])
+    df.loc[:, "directional_cosine_sim_variance"] = [
+        results[i][1] for i in range(n_cells)
+    ]
+    df.loc[:, "directional_cosine_sim_difference"] = [
+        results[i][2] for i in range(n_cells)
+    ]
+    df.loc[:, "directional_variance"] = [results[i][3] for i in range(n_cells)]
+    df.loc[:, "directional_difference"] = [results[i][4] for i in range(n_cells)]
+    df.loc[:, "directional_cosine_sim_mean"] = [results[i][5] for i in range(n_cells)]
+
+    return df, cosine_sims
+
+
+def _directional_statistics_per_cell(
+    tensor: np.ndarray,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Internal function for parallelization.
+
+    Parameters
+    ----------
+    tensor
+        Shape of samples by genes for a given cell.
+    """
+    n_samples = tensor.shape[0]
+    # over samples axis
+    mean_velocity_of_cell = tensor.mean(0)
+    cosine_sims = [
+        _cosine_sim(tensor[i, :], mean_velocity_of_cell) for i in range(n_samples)
+    ]
+    angle_samples = [np.arccos(el) for el in cosine_sims]
+    return (
+        cosine_sims,
+        np.var(cosine_sims),
+        np.percentile(cosine_sims, 95) - np.percentile(cosine_sims, 5),
+        np.var(angle_samples),
+        np.percentile(angle_samples, 95) - np.percentile(angle_samples, 5),
+        np.mean(cosine_sims),
+    )
+
+
+def _centered_unit_vector(vector: np.ndarray) -> np.ndarray:
+    """Returns the centered unit vector of the vector."""
+    vector = vector - np.mean(vector)
+    return vector / np.linalg.norm(vector)
+
+
+def _cosine_sim(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
+    """Returns cosine similarity of the vectors."""
+    v1_u = _centered_unit_vector(v1)
+    v2_u = _centered_unit_vector(v2)
+    return np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)
