@@ -5,12 +5,7 @@ from .heatmap import heatmap
 from .paga import paga
 from .proportions import proportions
 from .scatter import diffmap, draw_graph, pca, phate, scatter, tsne, umap
-from .simulation import (
-    get_nuc_cyt_dynamics,
-    plot_nuc_cyt_dynamics,
-    plot_phase_portrait_nuc_cyt,
-    simulation,
-)
+from .simulation import simulation
 from .summary import summary
 from .utils import hist, plot
 from .velocity import velocity
