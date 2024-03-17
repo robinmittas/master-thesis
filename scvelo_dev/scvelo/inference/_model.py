@@ -489,8 +489,8 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         return_numpy: Optional[bool] = None,
         velo_statistic: str = "mean",
         velo_mode: Literal[
-            "spliced_cyt", "spliced_nuc", "unspliced_nuc"
-        ] = "spliced_cyt",
+            "spliced_cyt", "spliced_nuc", "spliced_sum", "unspliced_nuc"
+        ] = "spliced_sum",
         clip: bool = True,
     ) -> Union[np.ndarray, pd.DataFrame]:
         """Returns cells by genes velocity estimates.
@@ -597,8 +597,10 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     velo_rep = nu * mean_s_nuc_rep - gamma * mean_s_cyt_rep
                 elif velo_mode == "spliced_nuc":
                     velo_rep = beta * mean_u_nuc_rep - nu * mean_s_nuc_rep
-                else:
+                elif velo_mode == "unspliced_nuc":
                     velo_rep = alpha - beta * mean_u_nuc_rep
+                elif velo_mode == "spliced_sum":
+                    velo_rep = beta * mean_u_nuc_rep - gamma * mean_s_cyt_rep
 
                 ind_time = switch_time * rho
                 (
@@ -612,8 +614,10 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     velo_ind = nu * mean_s_nuc_ind - gamma * mean_s_cyt_ind
                 elif velo_mode == "spliced_nuc":
                     velo_ind = beta * mean_u_nuc_ind - nu * mean_s_nuc_ind
-                else:
+                elif velo_mode == "unspliced_nuc":
                     velo_ind = alpha - beta * mean_u_nuc_ind
+                elif velo_mode == "spliced_sum":
+                    velo_ind = beta * mean_u_nuc_ind - gamma * mean_s_cyt_ind
 
                 velo_steady = torch.zeros_like(velo_ind)
 
