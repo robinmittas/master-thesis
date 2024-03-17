@@ -1,13 +1,12 @@
 import logging
 import warnings
-from typing import Iterable, List, Literal, Optional, Sequence, Tuple, Union
-
-from joblib import delayed, Parallel
+from typing import List, Literal, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
+from scipy.stats import ttest_ind
 
 from anndata import AnnData
 from scvi.data import AnnDataManager
@@ -1016,143 +1015,118 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
         adata_manager.register_fields(adata, **kwargs)
         cls.register_manager(adata_manager)
 
-    def get_directional_uncertainty(
-        self,
-        adata: Optional[AnnData] = None,
-        n_samples: int = 100,
-        gene_list: Iterable[str] = None,
-        n_jobs: int = -1,
-        velo_mode: Literal[
-            "spliced_cyt", "spliced_nuc", "unspliced_nuc"
-        ] = "spliced_nuc",
-    ):
-        r"""Returns intrinsic uncertainty.
+    def get_directional_uncertainty(self):
+        raise NotImplementedError
+
+    def get_permutation_scores(
+        self, labels_key: str, adata: Optional[AnnData] = None
+    ) -> Tuple[pd.DataFrame, AnnData]:
+        """Compute permutation scores.
 
         Parameters
         ----------
+        labels_key
+            Key in adata.obs encoding cell types
         adata
             AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
             AnnData object used to initialize the model.
-        gene_list
-            Return frequencies of expression for a subset of genes.
-            This can save memory when working with large datasets and few genes are
-            of interest.
-        n_samples
-            Number of posterior samples to use for estimation.
-        n_jobs
-            Number of jobs for parallel computing.
-        velo_mode
-            Which derivative to use to sample velocties.
 
         Returns
         -------
-        For each cell intrinsic variance statistics as `pd.DataFrame` together with `np.array`
+        Tuple of DataFrame and AnnData. DataFrame is genes by cell types with score per cell type.
+        AnnData is the permutated version of the original AnnData.
         """
         adata = self._validate_anndata(adata)
+        adata_manager = self.get_anndata_manager(adata)
+        if labels_key not in adata.obs:
+            raise ValueError(f"{labels_key} not found in adata.obs")
 
-        logger.info("Sampling from model...")
-        velocities_all = self.get_velocity(
-            n_samples=n_samples,
-            return_mean=False,
-            gene_list=gene_list,
-            velo_mode=velo_mode,
-        )  # (n_samples, n_cells, n_genes)
-
-        df, cosine_sims = _compute_directional_statistics_tensor(
-            tensor=velocities_all, n_jobs=n_jobs, n_cells=adata.n_obs
+        # shuffle spliced then unspliced
+        bdata = self._shuffle_layer_celltype(
+            adata_manager, labels_key, REGISTRY_KEYS.U_NUC_KEY
         )
-        df.index = adata.obs_names
+        bdata_manager = self.get_anndata_manager(bdata)
+        bdata = self._shuffle_layer_celltype(
+            bdata_manager, labels_key, REGISTRY_KEYS.S_NUC_KEY
+        )
+        bdata_manager = self.get_anndata_manager(bdata)
+        bdata = self._shuffle_layer_celltype(
+            bdata_manager, labels_key, REGISTRY_KEYS.S_CYT_KEY
+        )
+        bdata_manager = self.get_anndata_manager(bdata)
 
-        return df, cosine_sims
+        ms_cyt_ = adata_manager.get_from_registry(REGISTRY_KEYS.S_CYT_KEY)
+        ms_nuc_ = adata_manager.get_from_registry(REGISTRY_KEYS.S_NUC_KEY)
+        mu_nuc_ = adata_manager.get_from_registry(REGISTRY_KEYS.U_NUC_KEY)
 
-    def get_permutation_scores(self):
-        """Compute permutation scores."""
-        raise NotImplementedError
+        ms_cyt_p = bdata_manager.get_from_registry(REGISTRY_KEYS.S_CYT_KEY)
+        ms_nuc_p = bdata_manager.get_from_registry(REGISTRY_KEYS.S_NUC_KEY)
+        mu_nuc_p = bdata_manager.get_from_registry(REGISTRY_KEYS.U_NUC_KEY)
 
-    def _shuffle_layer_celltype(self):
+        spliced_cyt_, spliced_nuc_, unspliced_nuc_ = self.get_expression_fit(
+            adata, n_samples=10
+        )
+        root_squared_error = np.abs(spliced_cyt_ - ms_cyt_)
+        root_squared_error += np.abs(spliced_nuc_ - ms_nuc_)
+        root_squared_error += np.abs(unspliced_nuc_ - mu_nuc_)
+
+        spliced_cyt_p, spliced_nuc_p, unspliced_nuc_p = self.get_expression_fit(
+            bdata, n_samples=10
+        )
+        root_squared_error_p = np.abs(spliced_cyt_p - ms_cyt_p)
+        root_squared_error_p += np.abs(spliced_nuc_p - ms_nuc_p)
+        root_squared_error_p += np.abs(unspliced_nuc_p - mu_nuc_p)
+
+        celltypes = np.unique(adata.obs[labels_key])
+
+        dynamical_df = pd.DataFrame(
+            index=adata.var_names,
+            columns=celltypes,
+            data=np.zeros((adata.shape[1], len(celltypes))),
+        )
+        N = 200
+        for ct in celltypes:
+            for g in adata.var_names.tolist():
+                x = root_squared_error_p[g][adata.obs[labels_key] == ct]
+                y = root_squared_error[g][adata.obs[labels_key] == ct]
+                ratio = ttest_ind(x[:N], y[:N])[0]
+                dynamical_df.loc[g, ct] = ratio
+
+        return dynamical_df, bdata
+
+    def _shuffle_layer_celltype(
+        self, adata_manager: AnnDataManager, labels_key: str, registry_key: str
+    ) -> AnnData:
         """Shuffle cells within cell types for each gene."""
-        raise NotImplementedError
+        from scvi.data._constants import _SCVI_UUID_KEY
 
+        bdata = adata_manager.adata.copy()
+        labels = bdata.obs[labels_key]
+        del bdata.uns[_SCVI_UUID_KEY]
+        self._validate_anndata(bdata)
+        bdata_manager = self.get_anndata_manager(bdata)
 
-def _compute_directional_statistics_tensor(
-    tensor: np.ndarray, n_jobs: int, n_cells: int
-) -> pd.DataFrame:
-    """Parallelizes function calls to compute directional uncertainty.
+        # get registry info to later set data back in bdata
+        # in a way that doesn't require actual knowledge of location
+        data_layer = bdata_manager.get_from_registry(registry_key)
+        data_registry = bdata_manager.data_registry[registry_key]
+        attr_name = data_registry.attr_name
+        attr_key = data_registry.attr_key
 
-    Parameters
-    ----------
-       tensors
-           Velocity tensor.
-       n_jobs
-           Number of jobs for parallel computing.
-       n_cells
-           Number of cells.
+        for lab in np.unique(labels):
+            mask = np.asarray(labels == lab)
+            data_layer_ct = data_layer[mask].copy()
+            data_layer_ct = np.apply_along_axis(
+                np.random.permutation, axis=0, arr=data_layer_ct
+            )
+            data_layer[mask] = data_layer_ct
+        # e.g., if using adata.X
+        if attr_key is None:
+            setattr(bdata, attr_name, data_layer)
+        # e.g., if using a layer
+        elif attr_key is not None:
+            attribute = getattr(bdata, attr_name)
+            attribute[attr_key] = data_layer
+            setattr(bdata, attr_name, attribute)
 
-    Returns
-    -------
-       For each cell intrinsic variance statistics as `pd.DataFrame` together with `np.array`
-    """
-    df = pd.DataFrame(index=np.arange(n_cells))
-    df["directional_variance"] = np.nan
-    df["directional_difference"] = np.nan
-    df["directional_cosine_sim_variance"] = np.nan
-    df["directional_cosine_sim_difference"] = np.nan
-    df["directional_cosine_sim_mean"] = np.nan
-    logger.info("Computing the uncertainties...")
-    results = Parallel(n_jobs=n_jobs, verbose=3)(
-        delayed(_directional_statistics_per_cell)(tensor[:, cell_index, :])
-        for cell_index in range(n_cells)
-    )
-    # cells by samples
-    cosine_sims = np.stack([results[i][0] for i in range(n_cells)])
-    df.loc[:, "directional_cosine_sim_variance"] = [
-        results[i][1] for i in range(n_cells)
-    ]
-    df.loc[:, "directional_cosine_sim_difference"] = [
-        results[i][2] for i in range(n_cells)
-    ]
-    df.loc[:, "directional_variance"] = [results[i][3] for i in range(n_cells)]
-    df.loc[:, "directional_difference"] = [results[i][4] for i in range(n_cells)]
-    df.loc[:, "directional_cosine_sim_mean"] = [results[i][5] for i in range(n_cells)]
-
-    return df, cosine_sims
-
-
-def _directional_statistics_per_cell(
-    tensor: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Internal function for parallelization.
-
-    Parameters
-    ----------
-    tensor
-        Shape of samples by genes for a given cell.
-    """
-    n_samples = tensor.shape[0]
-    # over samples axis
-    mean_velocity_of_cell = tensor.mean(0)
-    cosine_sims = [
-        _cosine_sim(tensor[i, :], mean_velocity_of_cell) for i in range(n_samples)
-    ]
-    angle_samples = [np.arccos(el) for el in cosine_sims]
-    return (
-        cosine_sims,
-        np.var(cosine_sims),
-        np.percentile(cosine_sims, 95) - np.percentile(cosine_sims, 5),
-        np.var(angle_samples),
-        np.percentile(angle_samples, 95) - np.percentile(angle_samples, 5),
-        np.mean(cosine_sims),
-    )
-
-
-def _centered_unit_vector(vector: np.ndarray) -> np.ndarray:
-    """Returns the centered unit vector of the vector."""
-    vector = vector - np.mean(vector)
-    return vector / np.linalg.norm(vector)
-
-
-def _cosine_sim(v1: np.ndarray, v2: np.ndarray) -> np.ndarray:
-    """Returns cosine similarity of the vectors."""
-    v1_u = _centered_unit_vector(v1)
-    v2_u = _centered_unit_vector(v2)
-    return np.clip(np.dot(v1_u, v2_u), -1.0, 1.0)
+        return bdata
