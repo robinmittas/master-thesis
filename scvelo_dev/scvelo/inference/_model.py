@@ -6,7 +6,6 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
-from scipy.stats import ttest_ind
 
 from anndata import AnnData
 from scvi.data import AnnDataManager
@@ -424,7 +423,7 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 ind_prob = pi[..., 0]
                 steady_prob = pi[..., 1]
                 rep_prob = pi[..., 2]
-                # rep_steady_prob = pi[..., 3]
+                pi[..., 3]
                 switch_time = F.softplus(self.module.switch_time_unconstr)
 
                 ind_time = generative_outputs["px_rho"] * switch_time
@@ -438,6 +437,142 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                         + rep_prob * rep_time
                         + steady_prob * switch_time
                         # + rep_steady_prob * self.module.t_max
+                    )
+                else:
+                    t = torch.stack(
+                        [
+                            ind_time,
+                            switch_time.expand(ind_time.shape),
+                            rep_time,
+                            torch.zeros_like(ind_time),
+                        ],
+                        dim=2,
+                    )
+                    max_prob = torch.amax(pi, dim=-1)
+                    max_prob = torch.stack([max_prob] * 4, dim=2)
+                    max_prob_mask = pi.ge(max_prob)
+                    output = (t * max_prob_mask).sum(dim=-1)
+
+                output = output[..., gene_mask]
+                output = output.cpu().numpy()
+                minibatch_samples.append(output)
+            # samples by cells by genes by four
+            times.append(np.stack(minibatch_samples, axis=0))
+            if return_mean:
+                times[-1] = np.mean(times[-1], axis=0)
+
+        if n_samples > 1:
+            # The -2 axis correspond to cells.
+            times = np.concatenate(times, axis=-2)
+        else:
+            times = np.concatenate(times, axis=0)
+
+        if return_numpy is None or return_numpy is False:
+            return pd.DataFrame(
+                times,
+                columns=adata.var_names[gene_mask],
+                index=adata.obs_names[indices],
+            )
+        else:
+            return times
+
+    @torch.inference_mode()
+    def get_latent_time_with_rep_ss(
+        self,
+        adata: Optional[AnnData] = None,
+        indices: Optional[Sequence[int]] = None,
+        gene_list: Optional[Sequence[str]] = None,
+        time_statistic: Literal["mean", "max"] = "mean",
+        n_samples: int = 1,
+        n_samples_overall: Optional[int] = None,
+        batch_size: Optional[int] = None,
+        return_mean: bool = True,
+        return_numpy: Optional[bool] = None,
+    ) -> Union[np.ndarray, pd.DataFrame]:
+        """Returns the cells by genes latent time.
+
+        Parameters
+        ----------
+        adata
+            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
+            AnnData object used to initialize the model.
+        indices
+            Indices of cells in adata to use. If `None`, all cells are used.
+        gene_list
+            Return frequencies of expression for a subset of genes.
+            This can save memory when working with large datasets and few genes are
+            of interest.
+        time_statistic
+            Whether to compute expected time over states, or maximum a posteriori time over maximal
+            probability state.
+        n_samples
+            Number of posterior samples to use for estimation.
+        n_samples_overall
+            Number of overall samples to return. Setting this forces n_samples=1.
+        batch_size
+            Minibatch size for data loading into model. Defaults to `scvi.settings.batch_size`.
+        return_mean
+            Whether to return the mean of the samples.
+        return_numpy
+            Return a :class:`~numpy.ndarray` instead of a :class:`~pandas.DataFrame`. DataFrame includes
+            gene names as columns. If either `n_samples=1` or `return_mean=True`, defaults to `False`.
+            Otherwise, it defaults to `True`.
+
+        Returns
+        -------
+        If `n_samples` > 1 and `return_mean` is False, then the shape is `(samples, cells, genes)`.
+        Otherwise, shape is `(cells, genes)`. In this case, return type is :class:`~pandas.DataFrame` unless `return_numpy` is True.
+        """
+        adata = self._validate_anndata(adata)
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+        if n_samples_overall is not None:
+            indices = np.random.choice(indices, n_samples_overall)
+        scdl = self._make_data_loader(
+            adata=adata, indices=indices, batch_size=batch_size
+        )
+
+        if gene_list is None:
+            gene_mask = slice(None)
+        else:
+            all_genes = adata.var_names
+            gene_mask = [True if gene in gene_list else False for gene in all_genes]
+
+        if n_samples > 1 and return_mean is False:
+            if return_numpy is False:
+                warnings.warn(
+                    "return_numpy must be True if n_samples > 1 and return_mean is False, returning np.ndarray"
+                )
+            return_numpy = True
+        if indices is None:
+            indices = np.arange(adata.n_obs)
+
+        times = []
+        for tensors in scdl:
+            minibatch_samples = []
+            for _ in range(n_samples):
+                _, generative_outputs = self.module.forward(
+                    tensors=tensors,
+                    compute_loss=False,
+                )
+                pi = generative_outputs["px_pi"]
+                ind_prob = pi[..., 0]
+                steady_prob = pi[..., 1]
+                rep_prob = pi[..., 2]
+                rep_steady_prob = pi[..., 3]
+                switch_time = F.softplus(self.module.switch_time_unconstr)
+
+                ind_time = generative_outputs["px_rho"] * switch_time
+                rep_time = switch_time + (
+                    generative_outputs["px_tau"] * (self.module.t_max - switch_time)
+                )
+
+                if time_statistic == "mean":
+                    output = (
+                        ind_prob * ind_time
+                        + rep_prob * rep_time
+                        + steady_prob * switch_time
+                        + rep_steady_prob * self.module.t_max
                     )
                 else:
                     t = torch.stack(
@@ -574,8 +709,9 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 rho = generative_outputs["px_rho"]
 
                 ind_prob = pi[..., 0]
-                steady_prob = pi[..., 1]
+                ind_steady_prob = pi[..., 1]
                 rep_prob = pi[..., 2]
+                rep_steady_prob = pi[..., 3]
                 switch_time = F.softplus(self.module.switch_time_unconstr)
 
                 (
@@ -599,7 +735,7 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                 elif velo_mode == "spliced_nuc":
                     velo_rep = beta * mean_u_nuc_rep - nu * mean_s_nuc_rep
                 else:
-                    velo_rep = alpha - beta * mean_u_nuc_rep
+                    velo_rep = -beta * mean_u_nuc_rep
 
                 ind_time = switch_time * rho
                 (
@@ -623,7 +759,8 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
                     output = (
                         ind_prob * velo_ind
                         + rep_prob * velo_rep
-                        + steady_prob * velo_steady
+                        + (ind_steady_prob + rep_steady_prob)
+                        * velo_steady  # zero velocity in steady states!
                     )
                 # maximum
                 else:
@@ -1018,115 +1155,10 @@ class VELOVI(VAEMixin, UnsupervisedTrainingMixin, BaseModelClass):
     def get_directional_uncertainty(self):
         raise NotImplementedError
 
-    def get_permutation_scores(
-        self, labels_key: str, adata: Optional[AnnData] = None
-    ) -> Tuple[pd.DataFrame, AnnData]:
-        """Compute permutation scores.
+    def get_permutation_scores(self):
+        """Compute permutation scores."""
+        raise NotImplementedError
 
-        Parameters
-        ----------
-        labels_key
-            Key in adata.obs encoding cell types
-        adata
-            AnnData object with equivalent structure to initial AnnData. If `None`, defaults to the
-            AnnData object used to initialize the model.
-
-        Returns
-        -------
-        Tuple of DataFrame and AnnData. DataFrame is genes by cell types with score per cell type.
-        AnnData is the permutated version of the original AnnData.
-        """
-        adata = self._validate_anndata(adata)
-        adata_manager = self.get_anndata_manager(adata)
-        if labels_key not in adata.obs:
-            raise ValueError(f"{labels_key} not found in adata.obs")
-
-        # shuffle spliced then unspliced
-        bdata = self._shuffle_layer_celltype(
-            adata_manager, labels_key, REGISTRY_KEYS.U_NUC_KEY
-        )
-        bdata_manager = self.get_anndata_manager(bdata)
-        bdata = self._shuffle_layer_celltype(
-            bdata_manager, labels_key, REGISTRY_KEYS.S_NUC_KEY
-        )
-        bdata_manager = self.get_anndata_manager(bdata)
-        bdata = self._shuffle_layer_celltype(
-            bdata_manager, labels_key, REGISTRY_KEYS.S_CYT_KEY
-        )
-        bdata_manager = self.get_anndata_manager(bdata)
-
-        ms_cyt_ = adata_manager.get_from_registry(REGISTRY_KEYS.S_CYT_KEY)
-        ms_nuc_ = adata_manager.get_from_registry(REGISTRY_KEYS.S_NUC_KEY)
-        mu_nuc_ = adata_manager.get_from_registry(REGISTRY_KEYS.U_NUC_KEY)
-
-        ms_cyt_p = bdata_manager.get_from_registry(REGISTRY_KEYS.S_CYT_KEY)
-        ms_nuc_p = bdata_manager.get_from_registry(REGISTRY_KEYS.S_NUC_KEY)
-        mu_nuc_p = bdata_manager.get_from_registry(REGISTRY_KEYS.U_NUC_KEY)
-
-        spliced_cyt_, spliced_nuc_, unspliced_nuc_ = self.get_expression_fit(
-            adata, n_samples=10
-        )
-        root_squared_error = np.abs(spliced_cyt_ - ms_cyt_)
-        root_squared_error += np.abs(spliced_nuc_ - ms_nuc_)
-        root_squared_error += np.abs(unspliced_nuc_ - mu_nuc_)
-
-        spliced_cyt_p, spliced_nuc_p, unspliced_nuc_p = self.get_expression_fit(
-            bdata, n_samples=10
-        )
-        root_squared_error_p = np.abs(spliced_cyt_p - ms_cyt_p)
-        root_squared_error_p += np.abs(spliced_nuc_p - ms_nuc_p)
-        root_squared_error_p += np.abs(unspliced_nuc_p - mu_nuc_p)
-
-        celltypes = np.unique(adata.obs[labels_key])
-
-        dynamical_df = pd.DataFrame(
-            index=adata.var_names,
-            columns=celltypes,
-            data=np.zeros((adata.shape[1], len(celltypes))),
-        )
-        N = 200
-        for ct in celltypes:
-            for g in adata.var_names.tolist():
-                x = root_squared_error_p[g][adata.obs[labels_key] == ct]
-                y = root_squared_error[g][adata.obs[labels_key] == ct]
-                ratio = ttest_ind(x[:N], y[:N])[0]
-                dynamical_df.loc[g, ct] = ratio
-
-        return dynamical_df, bdata
-
-    def _shuffle_layer_celltype(
-        self, adata_manager: AnnDataManager, labels_key: str, registry_key: str
-    ) -> AnnData:
+    def _shuffle_layer_celltype(self):
         """Shuffle cells within cell types for each gene."""
-        from scvi.data._constants import _SCVI_UUID_KEY
-
-        bdata = adata_manager.adata.copy()
-        labels = bdata.obs[labels_key]
-        del bdata.uns[_SCVI_UUID_KEY]
-        self._validate_anndata(bdata)
-        bdata_manager = self.get_anndata_manager(bdata)
-
-        # get registry info to later set data back in bdata
-        # in a way that doesn't require actual knowledge of location
-        data_layer = bdata_manager.get_from_registry(registry_key)
-        data_registry = bdata_manager.data_registry[registry_key]
-        attr_name = data_registry.attr_name
-        attr_key = data_registry.attr_key
-
-        for lab in np.unique(labels):
-            mask = np.asarray(labels == lab)
-            data_layer_ct = data_layer[mask].copy()
-            data_layer_ct = np.apply_along_axis(
-                np.random.permutation, axis=0, arr=data_layer_ct
-            )
-            data_layer[mask] = data_layer_ct
-        # e.g., if using adata.X
-        if attr_key is None:
-            setattr(bdata, attr_name, data_layer)
-        # e.g., if using a layer
-        elif attr_key is not None:
-            attribute = getattr(bdata, attr_name)
-            attribute[attr_key] = data_layer
-            setattr(bdata, attr_name, attribute)
-
-        return bdata
+        raise NotImplementedError

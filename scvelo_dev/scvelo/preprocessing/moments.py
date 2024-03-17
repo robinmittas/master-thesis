@@ -1,3 +1,5 @@
+from typing import Optional
+
 import numpy as np
 from scipy.sparse import csr_matrix, issparse
 
@@ -16,6 +18,7 @@ def moments(
     use_rep=None,
     use_highly_variable=True,
     copy=False,
+    layers: Optional[dict] = None,
 ):
     """Computes moments for velocity estimation.
 
@@ -45,6 +48,9 @@ def moments(
         Whether to use highly variable genes only, stored in .var['highly_variable'].
     copy: `bool` (default: `False`)
         Return a copy instead of writing to adata.
+    layers
+        An optional dict containing existing layers to calculate moments of as keys. Values are target layers.
+        Can be used for Nuc/ Cyt model as {"spliced_cytoplasm": "Ms_cyt", "spliced_nucleus": "Ms_nuc", "unspliced_nucleus": "Mu_nuc"}
 
     Returns
     -------
@@ -53,11 +59,13 @@ def moments(
     Mu: `.layers`
         dense matrix with first order moments of unspliced counts.
     """
+    if layers is None:
+        layers = {"spliced": "Ms", "unspliced": "Mu"}
     adata = data.copy() if copy else data
 
-    layers = [layer for layer in {"spliced", "unspliced"} if layer in adata.layers]
+    layers_ = [layer for layer in layers if layer in adata.layers]
     if any([not_yet_normalized(adata.layers[layer]) for layer in layers]):
-        normalize_per_cell(adata)
+        normalize_per_cell(adata, layers=layers)
 
     if n_neighbors is not None and n_neighbors > get_n_neighs(adata):
         neighbors(
@@ -78,16 +86,13 @@ def moments(
             adata, mode, n_neighbors=n_neighbors, recurse_neighbors=False
         )
 
-        adata.layers["Ms"] = (
-            csr_matrix.dot(connectivities, csr_matrix(adata.layers["spliced"]))
-            .astype(np.float32)
-            .A
-        )
-        adata.layers["Mu"] = (
-            csr_matrix.dot(connectivities, csr_matrix(adata.layers["unspliced"]))
-            .astype(np.float32)
-            .A
-        )
+        for layer in layers_:
+            adata.layers[layers[layer]] = (
+                csr_matrix.dot(connectivities, csr_matrix(adata.layers[layer]))
+                .astype(np.float32)
+                .A
+            )
+
         # if renormalize: normalize_per_cell(adata, layers={'Ms', 'Mu'}, enforce=True)
 
         logg.info(
@@ -95,7 +100,7 @@ def moments(
         )
         logg.hint(
             "added \n"
-            "    'Ms' and 'Mu', moments of un/spliced abundances (adata.layers)"
+            f"    {list(layers.values())} moments of un/spliced abundances (adata.layers)"
         )
     return adata if copy else None
 

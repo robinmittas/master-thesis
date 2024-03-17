@@ -1,3 +1,4 @@
+from ._imputation import estimate_abundance
 from .moments import moments
 from .neighbors import neighbors, pca, remove_duplicate_cells
 from .utils import (

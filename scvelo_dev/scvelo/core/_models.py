@@ -373,30 +373,33 @@ class NucCytModel(DynamicsBase):
             * splicing_rate
             * (
                 (
-                    transcription_rate * (1 - np.exp(-splicing_rate * tau))
+                    transcription_rate
+                    / splicing_rate
+                    * (1 - np.exp(-splicing_rate * tau))
                     + u0_nuc * np.exp(-splicing_rate * tau)
                 )
                 / (
-                    splicing_rate
-                    * (nuc_export_rate - splicing_rate)
+                    (nuc_export_rate - splicing_rate)
                     * (degradation_rate - splicing_rate)
                 )
                 - (
-                    transcription_rate * (1 - np.exp(-nuc_export_rate * tau))
+                    transcription_rate
+                    / nuc_export_rate
+                    * (1 - np.exp(-nuc_export_rate * tau))
                     + u0_nuc * np.exp(-nuc_export_rate * tau)
                 )
                 / (
-                    nuc_export_rate
-                    * (nuc_export_rate - splicing_rate)
+                    (nuc_export_rate - splicing_rate)
                     * (degradation_rate - nuc_export_rate)
                 )
                 + (
-                    transcription_rate * (1 - np.exp(-degradation_rate * tau))
+                    transcription_rate
+                    / degradation_rate
+                    * (1 - np.exp(-degradation_rate * tau))
                     + u0_nuc * np.exp(-degradation_rate * tau)
                 )
                 / (
-                    degradation_rate
-                    * (degradation_rate - splicing_rate)
+                    (degradation_rate - splicing_rate)
                     * (degradation_rate - nuc_export_rate)
                 )
             )
