@@ -618,15 +618,7 @@ class VELOVAE(BaseModuleClass):
         mixture_dist_s_nuc = MixtureSameFamily(comp_dist, dist_s_nuc)
 
         # spliced cytoplasm
-        scale_s_cyt = torch.stack(
-            (
-                scale_s_cyt[..., 0],
-                scale_s_cyt[..., 0],
-                scale_s_cyt[..., 0],
-                0.1 * scale_s_cyt[..., 0],
-            ),
-            dim=2,
-        )
+        scale_s_cyt = scale_s_nuc
         mean_s_cyt = torch.stack(
             (
                 mean_s_cyt_ind,
